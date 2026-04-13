@@ -1,27 +1,47 @@
-name: Android Release (Signed)
+name: Android Build
 
 on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Also publish APK to GitHub Release"
+        required: false
+        default: false
+        type: boolean
+
   push:
+    branches:
+      - mcp-main
     tags:
       - 'v*'
-  workflow_dispatch:
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-android:
+    name: Build Android APK
     runs-on: ubuntu-latest
-    outputs:
-      app_version: ${{ steps.version.outputs.app_version }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
-          java-version: '17'
           distribution: temurin
+          java-version: '17'
           cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -30,58 +50,131 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Get dependencies
-        run: flutter pub get
+      - name: Flutter Doctor
+        run: flutter doctor -v
+
+      - name: Read App Version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          RAW_VERSION=$(grep '^version:' pubspec.yaml | awk '{print $2}')
+          APP_VERSION="${RAW_VERSION%%+*}"
+          BUILD_NUMBER="${RAW_VERSION#*+}"
+          if [[ "$RAW_VERSION" == "$APP_VERSION" ]]; then
+            BUILD_NUMBER="0"
+          fi
+
+          echo "raw_version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
+          echo "app_version=$APP_VERSION" >> "$GITHUB_OUTPUT"
+          echo "build_number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+
+          echo "APP_VERSION=$APP_VERSION" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=$BUILD_NUMBER" >> "$GITHUB_ENV"
+
+      - name: Prepare Android signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p android/app
+
+          if [[ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 || '' }}" ]]; then
+            echo "Using release keystore from GitHub Secrets"
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
+
+            cat > android/key.properties <<EOF
+            storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}
+            keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+            keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+            storeFile=app/release.keystore
+            EOF
+          else
+            echo "No signing secrets found, generating fallback debug keystore"
+
+            keytool -genkeypair \
+              -v \
+              -storetype JKS \
+              -keystore android/app/debug-signing.keystore \
+              -alias androiddebugkey \
+              -storepass android \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+
+            cat > android/key.properties <<EOF
+            storePassword=android
+            keyPassword=android
+            keyAlias=androiddebugkey
+            storeFile=app/debug-signing.keystore
+            EOF
+          fi
+
+      - name: Get Flutter dependencies (retry)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in 1 2 3; do
+            echo "Attempt $i: flutter pub get"
+            if flutter pub get; then
+              exit 0
+            fi
+            echo "flutter pub get failed, retrying..."
+            sleep 10
+          done
+          echo "flutter pub get failed after 3 attempts"
+          exit 1
 
       - name: Generate localization
+        shell: bash
         run: flutter gen-l10n
 
-      - name: Read app version
-        id: version
+      - name: Build Android APK (retry)
+        shell: bash
         run: |
-          RAW=$(grep '^version:' pubspec.yaml | awk '{print $2}')
-          VERSION=$(echo "$RAW" | cut -d'+' -f1)
-          echo "app_version=$VERSION" >> $GITHUB_OUTPUT
-          echo "APP_VERSION=$VERSION" >> $GITHUB_ENV
+          set -euo pipefail
+          for i in 1 2; do
+            echo "Attempt $i: flutter build apk --release"
+            if flutter build apk --release; then
+              exit 0
+            fi
+            echo "Build failed, retrying after cleanup..."
+            flutter clean
+            flutter pub get
+            sleep 15
+          done
+          echo "Android build failed after retries"
+          exit 1
 
-      # 写入签名文件
-      - name: Decode keystore
-        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/key.jks
-
-      # 构建签名 APK
-      - name: Build release APK
-        run: flutter build apk --release
-
-      # 重命名带版本号，方便识别
-      - name: Rename APK
+      - name: Verify APK exists
+        shell: bash
         run: |
-          mv build/app/outputs/flutter-apk/app-release.apk \
-             proxypin-mcp-android-${{ env.APP_VERSION }}-signed.apk
+          set -euo pipefail
+          ls -lah build/app/outputs/flutter-apk/
+          test -f build/app/outputs/flutter-apk/proxypin-android.apk
 
-      - name: Upload APK
+      - name: Prepare release artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/proxypin-android.apk \
+             dist/proxypin-mcp-android-${APP_VERSION}.apk
+          ls -lah dist
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: android-apk
-          path: proxypin-mcp-android-${{ env.APP_VERSION }}-signed.apk
+          name: proxypin-mcp-android-${{ steps.version.outputs.app_version }}
+          path: dist/proxypin-mcp-android-${{ steps.version.outputs.app_version }}.apk
+          if-no-files-found: error
 
-  # 自动创建 GitHub Release
-  publish-release:
-    needs: build-android
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
-    steps:
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Create GitHub Release
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release == true
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('manual-{0}', github.run_number) }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('manual-{0}', github.run_number) }}
           generate_release_notes: true
-          fail_on_unmatched_files: true
+          files: dist/proxypin-mcp-android-${{ steps.version.outputs.app_version }}.apk
