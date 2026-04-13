@@ -78,16 +78,16 @@ jobs:
           set -euo pipefail
           mkdir -p android/app
 
-          if [[ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 || '' }}" ]]; then
+          if [[ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]]; then
             echo "Using release keystore from GitHub Secrets"
             echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
 
-            cat > android/key.properties <<EOF
-            storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}
-            keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
-            keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
-            storeFile=app/release.keystore
-            EOF
+            {
+              echo "storePassword=${{ secrets.ANDROID_STORE_PASSWORD }}"
+              echo "keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}"
+              echo "keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}"
+              echo "storeFile=app/release.keystore"
+            } > android/key.properties
           else
             echo "No signing secrets found, generating fallback debug keystore"
 
@@ -103,13 +103,16 @@ jobs:
               -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
 
-            cat > android/key.properties <<EOF
-            storePassword=android
-            keyPassword=android
-            keyAlias=androiddebugkey
-            storeFile=app/debug-signing.keystore
-            EOF
+            {
+              echo "storePassword=android"
+              echo "keyPassword=android"
+              echo "keyAlias=androiddebugkey"
+              echo "storeFile=app/debug-signing.keystore"
+            } > android/key.properties
           fi
+
+          echo "Generated android/key.properties"
+          cat android/key.properties | sed 's/=.*/=***/'
 
       - name: Get Flutter dependencies (retry)
         shell: bash
@@ -159,8 +162,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp build/app/outputs/flutter-apk/proxypin-android.apk \
-             dist/proxypin-mcp-android-${APP_VERSION}.apk
+          cp build/app/outputs/flutter-apk/proxypin-android.apk dist/proxypin-mcp-android-${APP_VERSION}.apk
           ls -lah dist
 
       - name: Upload build artifact
@@ -171,7 +173,7 @@ jobs:
           if-no-files-found: error
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish_release == true
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.publish_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('manual-{0}', github.run_number) }}
