@@ -113,8 +113,6 @@ jobs:
 
           echo "Generated android/key.properties"
           sed 's/=.*/=***/' android/key.properties
-
-          echo "Check keystore files:"
           ls -lah android/app/
 
       - name: Get Flutter dependencies (retry)
@@ -153,19 +151,29 @@ jobs:
           echo "Android build failed after retries"
           exit 1
 
-      - name: Verify APK exists
+      - name: Locate APK
+        id: apk
         shell: bash
         run: |
           set -euo pipefail
           ls -lah build/app/outputs/flutter-apk/
-          test -f build/app/outputs/flutter-apk/proxypin-android.apk
+
+          APK_PATH=$(find build/app/outputs/flutter-apk -maxdepth 1 -type f -name "*.apk" | head -n 1)
+
+          if [[ -z "${APK_PATH:-}" ]]; then
+            echo "No APK found in build/app/outputs/flutter-apk/"
+            exit 1
+          fi
+
+          echo "Found APK: $APK_PATH"
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Prepare release artifact
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp build/app/outputs/flutter-apk/proxypin-android.apk dist/proxypin-mcp-android-${APP_VERSION}.apk
+          cp "${{ steps.apk.outputs.apk_path }}" "dist/proxypin-mcp-android-${APP_VERSION}.apk"
           ls -lah dist
 
       - name: Upload build artifact
